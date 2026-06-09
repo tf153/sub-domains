@@ -167,8 +167,25 @@ and Certificate-Transparency discovery all work. Consequences:
 | `API_KEY` | unset | If set, `/api/scan` requires this key (Bearer / X-API-Key / `?api_key=`) |
 | `RATE_LIMIT` | `30` | Requests per minute per client IP for `/api/*` (0 disables) |
 | `CORS_ORIGINS` | unset | Comma-separated allowed origins, or `*` (enables CORS) |
+| `CACHE_TTL` | `10m` | Cache identical scans for this long (0 disables) |
 | `ALLOW_BRUTE` | unset | `1` to allow brute force via the API |
 | `VT_API_KEY` / `ST_API_KEY` | unset | Optional passive-DNS keys |
+
+### Why result counts can vary (and how this is handled)
+
+Subdomain counts come from **free third-party sources** (crt.sh, OTX, etc.)
+that are sometimes slow or rate-limited. If a source times out or returns `429`
+on one run, that run finds fewer hosts — which is why a domain can show 3 hosts
+once and 9 the next time.
+
+subscope makes this **transparent and stable**:
+
+- Every response includes a `sources` array with each source's `state`
+  (`ok` / `timeout` / `failed` / `skipped`), how many hosts it contributed,
+  and a `detail` message — so you can *see* exactly why a count changed.
+- `crt.sh` (the most important source) is **retried** on transient failures.
+- The server **caches** each domain+options result for `CACHE_TTL` (default
+  10 min), so repeated scans return the same data instantly.
 
 ### Deploy to DigitalOcean App Platform
 

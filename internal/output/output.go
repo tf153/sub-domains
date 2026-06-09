@@ -44,7 +44,24 @@ func Table(w io.Writer, r *model.Report) error {
 			resolved++
 		}
 	}
-	fmt.Fprintf(w, "Subdomains: %d discovered, %d resolving\n\n", len(r.Records), resolved)
+	fmt.Fprintf(w, "Subdomains: %d discovered, %d resolving", len(r.Records), resolved)
+	if r.Duration != "" {
+		fmt.Fprintf(w, " (in %s)", r.Duration)
+	}
+	fmt.Fprint(w, "\n\n")
+
+	// Per-source status explains the count (which source failed/timed out).
+	if len(r.Sources) > 0 {
+		fmt.Fprintln(w, "Sources:")
+		for _, s := range r.Sources {
+			line := fmt.Sprintf("  %-14s %-8s %d hosts", s.Name, s.State, s.Found)
+			if s.Detail != "" && s.State != "ok" {
+				line += "  — " + s.Detail
+			}
+			fmt.Fprintln(w, line)
+		}
+		fmt.Fprintln(w)
+	}
 
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(tw, "HOST\tADDRESSES\tIP OWNER (who holds it)\tSOURCES")

@@ -161,7 +161,21 @@ function render(r) {
       <div class="stat"><b>${recs.length}</b><span>subdomains found</span></div>
       <div class="stat"><b>${resolved}</b><span>resolving</span></div>
       <div class="stat"><b style="color:${takeovers.length?'var(--danger)':'var(--accent2)'}">${takeovers.length}</b><span>possible takeovers</span></div>
+      <div class="stat"><b>${esc(r.duration||"—")}</b><span>scan time${r.cached?" (cached)":""}</span></div>
     </div>`;
+
+  if (r.sources && r.sources.length) {
+    html += `<div style="margin-top:10px; display:flex; flex-wrap:wrap; gap:8px;">`;
+    for (const s of r.sources) {
+      const color = s.state === "ok" ? "var(--accent2)"
+                  : s.state === "skipped" ? "var(--muted)"
+                  : "var(--danger)";
+      const title = s.detail ? ` title="${esc(s.detail)}"` : "";
+      html += `<span class="tag"${title} style="border-color:${color}; color:${color}">`
+            + `${esc(s.name)}: ${esc(s.state)} (${s.found})</span>`;
+    }
+    html += `</div>`;
+  }
 
   if (takeovers.length) {
     html += `<div class="takeover"><h3>⚠ Possible subdomain takeovers</h3>`;

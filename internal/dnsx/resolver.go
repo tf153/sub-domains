@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/miekg/dns"
@@ -44,12 +45,23 @@ func New(server string, timeout time.Duration) *Resolver {
 		timeout = 5 * time.Second
 	}
 
+	// A pooled transport so the many concurrent DoH queries reuse keep-alive
+	// connections to the resolver instead of opening a new TLS handshake each
+	// time (the main source of per-host latency over DoH).
+	tr := &http.Transport{
+		MaxIdleConns:        200,
+		MaxIdleConnsPerHost: 100,
+		MaxConnsPerHost:     100,
+		IdleConnTimeout:     90 * time.Second,
+		ForceAttemptHTTP2:   true,
+	}
+
 	r := &Resolver{
 		client:  &dns.Client{Timeout: timeout},
 		server:  server,
 		timeout: timeout,
 		doh:     strings.HasPrefix(server, "https://"),
-		httpc:   &http.Client{Timeout: timeout},
+		httpc:   &http.Client{Timeout: timeout, Transport: tr},
 	}
 
 	if !r.doh {
@@ -79,15 +91,63 @@ func (r *Resolver) Exists(ctx context.Context, host string) bool {
 	return false
 }
 
-// Enrich fills in all DNS record types for rec.Host.
+// Enrich fills in all DNS record types for rec.Host. The six record-type
+// queries run concurrently to keep per-host latency low.
+//
+// CNAMEs are captured both from a direct CNAME query and from the answer chain
+// of the A/AAAA queries: recursive resolvers usually follow the CNAME and
+// return the final address records, with the CNAME RR included in the same
+// answer (and often no answer to a bare CNAME query). Extracting from the
+// chain ensures CNAMEs are reported even in that common case.
 func (r *Resolver) Enrich(ctx context.Context, rec *model.Record) {
-	rec.A = r.lookupStrings(ctx, rec.Host, dns.TypeA)
-	rec.AAAA = r.lookupStrings(ctx, rec.Host, dns.TypeAAAA)
-	rec.CNAME = r.lookupStrings(ctx, rec.Host, dns.TypeCNAME)
-	rec.MX = r.lookupStrings(ctx, rec.Host, dns.TypeMX)
-	rec.NS = r.lookupStrings(ctx, rec.Host, dns.TypeNS)
-	rec.TXT = r.lookupStrings(ctx, rec.Host, dns.TypeTXT)
+	var wg sync.WaitGroup
+	var aAns, aaaaAns []dns.RR
+
+	type job struct {
+		qtype uint16
+		store *[]string
+		raw   *[]dns.RR
+	}
+	jobs := []job{
+		{dns.TypeA, &rec.A, &aAns},
+		{dns.TypeAAAA, &rec.AAAA, &aaaaAns},
+		{dns.TypeCNAME, &rec.CNAME, nil},
+		{dns.TypeMX, &rec.MX, nil},
+		{dns.TypeNS, &rec.NS, nil},
+		{dns.TypeTXT, &rec.TXT, nil},
+	}
+
+	wg.Add(len(jobs))
+	for _, j := range jobs {
+		go func(j job) {
+			defer wg.Done()
+			answers := r.query(ctx, rec.Host, j.qtype)
+			*j.store = stringsFromRRs(answers)
+			if j.raw != nil {
+				*j.raw = answers
+			}
+		}(j)
+	}
+	wg.Wait()
+
+	// Merge any CNAMEs found inside the A/AAAA answer chains.
+	chainCNAMEs := cnamesFromRRs(append(append([]dns.RR{}, aAns...), aaaaAns...))
+	if len(chainCNAMEs) > 0 {
+		rec.CNAME = dedupe(append(rec.CNAME, chainCNAMEs...))
+	}
+
 	rec.Resolved = len(rec.A) > 0 || len(rec.AAAA) > 0 || len(rec.CNAME) > 0
+}
+
+// cnamesFromRRs extracts CNAME targets from a set of resource records.
+func cnamesFromRRs(rrs []dns.RR) []string {
+	var out []string
+	for _, rr := range rrs {
+		if c, ok := rr.(*dns.CNAME); ok {
+			out = append(out, strings.TrimSuffix(c.Target, "."))
+		}
+	}
+	return out
 }
 
 // query sends a single question and returns the answer section (nil if none).
@@ -143,7 +203,11 @@ func (r *Resolver) exchangeDoH(ctx context.Context, m *dns.Msg) (*dns.Msg, error
 
 // lookupStrings returns string representations of the requested record type.
 func (r *Resolver) lookupStrings(ctx context.Context, host string, qtype uint16) []string {
-	answers := r.query(ctx, host, qtype)
+	return stringsFromRRs(r.query(ctx, host, qtype))
+}
+
+// stringsFromRRs renders a set of resource records into display strings.
+func stringsFromRRs(answers []dns.RR) []string {
 	var out []string
 	for _, rr := range answers {
 		switch v := rr.(type) {

@@ -57,11 +57,24 @@ type DomainInfo struct {
 	Nameserver []string `json:"nameservers,omitempty"`
 }
 
+// SourceStatus reports the outcome of a single discovery source for a scan.
+// Surfacing this is what makes result counts explainable: if a run returns
+// fewer hosts, the status shows which source failed, timed out, or was skipped.
+type SourceStatus struct {
+	Name   string `json:"name"`
+	State  string `json:"state"`           // "ok", "failed", "skipped", "timeout"
+	Found  int    `json:"found"`           // hosts contributed (new uniques attributed to this source)
+	Detail string `json:"detail,omitempty"` // error or skip reason
+}
+
 // Report is the complete output of a scan.
 type Report struct {
-	Domain  string      `json:"domain"`
-	Whois   *DomainInfo `json:"whois,omitempty"`
-	Records []Record    `json:"records"`
+	Domain   string         `json:"domain"`
+	Whois    *DomainInfo    `json:"whois,omitempty"`
+	Records  []Record       `json:"records"`
+	Sources  []SourceStatus `json:"sources,omitempty"`
+	Cached   bool           `json:"cached,omitempty"`   // served from cache
+	Duration string         `json:"duration,omitempty"` // wall-clock scan time
 }
 
 // Set is a tiny concurrency-safe string set that tracks discovery sources

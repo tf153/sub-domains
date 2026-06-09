@@ -39,6 +39,10 @@ services:
       - key: RATE_LIMIT
         value: "30"
         scope: RUN_TIME
+      # Cache identical scans this long for stable, fast repeat results.
+      - key: CACHE_TTL
+        value: "10m"
+        scope: RUN_TIME
       # Protect the API with a key. STRONGLY RECOMMENDED for a public URL.
       # Set the real value as an encrypted secret in the dashboard (or via
       # `doctl apps update`), replacing the placeholder below.

@@ -30,6 +30,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -37,6 +38,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rahuljoshi/subscope/internal/cache"
 	"github.com/rahuljoshi/subscope/internal/httpmw"
 	"github.com/rahuljoshi/subscope/internal/scan"
 	"github.com/rahuljoshi/subscope/internal/web"
@@ -55,6 +57,7 @@ type server struct {
 	resolver    string
 	scanTimeout time.Duration
 	allowBrute  bool
+	cache       *cache.Cache
 }
 
 func main() {
@@ -63,10 +66,13 @@ func main() {
 	corsOrigins := os.Getenv("CORS_ORIGINS")
 	rateLimit := intEnv("RATE_LIMIT", 30)
 
+	cacheTTL := durEnv("CACHE_TTL", 10*time.Minute)
+
 	s := &server{
 		resolver:    env("DNS_RESOLVER", "https://cloudflare-dns.com/dns-query"),
 		scanTimeout: durEnv("SCAN_TIMEOUT", 60*time.Second),
 		allowBrute:  os.Getenv("ALLOW_BRUTE") == "1",
+		cache:       cache.New(cacheTTL),
 	}
 
 	mux := http.NewServeMux()
@@ -181,16 +187,26 @@ func (s *server) handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	brute := req.Brute && s.allowBrute
+
+	// Cache by domain + the option set so different toggles don't collide.
+	key := fmt.Sprintf("%s|p=%t|b=%t|w=%t|o=%t|t=%t", domain, req.Passive, brute, req.Whois, req.Owner, req.Takeover)
+	if cached, ok := s.cache.Get(key); ok {
+		writeJSON(w, http.StatusOK, cached)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), s.scanTimeout)
 	defer cancel()
 
 	opts := scan.Options{
 		Domain:         domain,
 		Resolver:       s.resolver,
-		Concurrency:    40,
-		Timeout:        8 * time.Second,
+		Concurrency:    60,
+		Timeout:        6 * time.Second,
+		SourceTimeout:  35 * time.Second,
 		EnablePassive:  req.Passive,
-		EnableBrute:    req.Brute && s.allowBrute,
+		EnableBrute:    brute,
 		EnableAXFR:     false,
 		EnableWhois:    req.Whois,
 		EnableOwner:    req.Owner,
@@ -202,6 +218,7 @@ func (s *server) handleScan(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "scan failed: " + err.Error()})
 		return
 	}
+	s.cache.Set(key, report)
 	writeJSON(w, http.StatusOK, report)
 }
 

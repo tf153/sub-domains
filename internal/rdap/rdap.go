@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rahuljoshi/subscope/internal/model"
@@ -19,7 +20,27 @@ import (
 
 const userAgent = "subscope/0.1"
 
-func client() *http.Client { return &http.Client{Timeout: 20 * time.Second} }
+// sharedClient is a single pooled HTTP client reused across all RDAP / ip-api
+// calls so connections (and TLS handshakes) are reused instead of recreated.
+var sharedClient = &http.Client{
+	Timeout: 15 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 50,
+		IdleConnTimeout:     90 * time.Second,
+		ForceAttemptHTTP2:   true,
+	},
+}
+
+func client() *http.Client { return sharedClient }
+
+// ipCache memoizes IP-owner lookups for the lifetime of the process. Many
+// subdomains share the same IPs (CDNs, load balancers), so this avoids
+// hammering rdap.org / ip-api with identical queries — a major speedup.
+var (
+	ipCacheMu sync.Mutex
+	ipCache   = make(map[string]*model.IPOwner)
+)
 
 // rdapResponse covers the subset of RDAP fields we care about for both ip and
 // domain queries.
@@ -107,27 +128,55 @@ func get(ctx context.Context, url string) (*rdapResponse, error) {
 
 // IP looks up who holds an IP address.
 func IP(ctx context.Context, ip string) (*model.IPOwner, error) {
-	r, err := get(ctx, "https://rdap.org/ip/"+ip)
-	if err != nil {
-		return nil, err
+	// Serve from cache when possible.
+	ipCacheMu.Lock()
+	if cached, ok := ipCache[ip]; ok {
+		ipCacheMu.Unlock()
+		return cached, nil
 	}
+	ipCacheMu.Unlock()
+
+	// Run the RDAP (org/handle) and ASN lookups concurrently.
+	var (
+		rdapResp *rdapResponse
+		rdapErr  error
+		asn      string
+		wg       sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		rdapResp, rdapErr = get(ctx, "https://rdap.org/ip/"+ip)
+	}()
+	go func() {
+		defer wg.Done()
+		asn = asnForIP(ctx, ip)
+	}()
+	wg.Wait()
+
+	if rdapErr != nil {
+		return nil, rdapErr
+	}
+
 	owner := &model.IPOwner{
 		IP:      ip,
-		Org:     r.Name,
-		Country: r.Country,
-		Handle:  r.Handle,
+		Org:     rdapResp.Name,
+		Country: rdapResp.Country,
+		Handle:  rdapResp.Handle,
+		ASN:     asn,
 	}
 	// Best-effort org name from entities if the network name is generic.
-	if org := orgFromEntities(r.Entities); org != "" {
+	if org := orgFromEntities(rdapResp.Entities); org != "" {
 		if owner.Org == "" {
 			owner.Org = org
 		} else if !strings.EqualFold(org, owner.Org) {
 			owner.Org = fmt.Sprintf("%s (%s)", owner.Org, org)
 		}
 	}
-	if asn := asnForIP(ctx, ip); asn != "" {
-		owner.ASN = asn
-	}
+
+	ipCacheMu.Lock()
+	ipCache[ip] = owner
+	ipCacheMu.Unlock()
 	return owner, nil
 }
 
@@ -156,8 +205,12 @@ func orgFromEntities(entities []entity) string {
 // universal, so we use the free ip-api-compatible cymru DNS approach handled
 // elsewhere). Here we return empty if unavailable; ASN is best-effort.
 func asnForIP(ctx context.Context, ip string) string {
-	// Use the BGP.tools / cymru whois-over-DNS is overkill here; rely on
-	// ip-api.com's free endpoint for ASN enrichment.
+	// ip-api.com is free but heavily rate-limited (~45 req/min) and can be
+	// slow; bound it tightly so a stalled/throttled ASN lookup never holds up
+	// the (more important) RDAP org result. ASN is best-effort.
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	var data struct {
 		AS string `json:"as"`
 	}
