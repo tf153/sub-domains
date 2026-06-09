@@ -105,11 +105,44 @@ go build -o bin/server ./cmd/server
 PORT=8099 ./bin/server          # then open http://localhost:8099
 ```
 
-Endpoints:
+### API
 
-- `GET /` — web UI
-- `GET /healthz` — health check
-- `POST /api/scan` — JSON: `{"domain":"example.com","passive":true,"whois":true,"owner":true,"takeover":true,"brute":false}`
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/` | Web UI |
+| `GET` | `/healthz` | Health check |
+| `GET` | `/api` | Self-describing JSON API docs |
+| `POST` | `/api/scan` | Run a scan (JSON body) |
+| `GET` | `/api/scan?domain=...` | Run a scan via query params (handy for curl) |
+
+**Authentication.** If `API_KEY` is set, every `/api/scan` call must send the
+key (the UI, `/`, `/healthz`, and `/api` docs stay public). Pass it any of:
+
+```bash
+# Authorization header (recommended)
+curl -X POST https://YOUR-APP.ondigitalocean.app/api/scan \
+  -H 'Authorization: Bearer YOUR_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"domain":"example.com","passive":true,"whois":true,"owner":true,"takeover":true}'
+
+# X-API-Key header
+curl "https://YOUR-APP.ondigitalocean.app/api/scan?domain=example.com" -H 'X-API-Key: YOUR_KEY'
+
+# query param (convenient, but leaks the key in logs — use sparingly)
+curl "https://YOUR-APP.ondigitalocean.app/api/scan?domain=example.com&api_key=YOUR_KEY"
+```
+
+Request fields (POST JSON or GET query params): `domain` (required),
+`passive`, `whois`, `owner`, `takeover` (default true), `brute` (default false;
+also requires `ALLOW_BRUTE=1` on the server). The response is the same JSON
+report schema the CLI emits with `-json`.
+
+**Rate limiting.** `/api/*` is limited per client IP (default 30 req/min;
+honors `X-Forwarded-For` behind the App Platform proxy). Over the limit returns
+`429 Too Many Requests`. Set `RATE_LIMIT=0` to disable.
+
+**CORS.** Set `CORS_ORIGINS` (comma-separated, or `*`) to allow a separate
+browser frontend to call the API.
 
 ### Why DNS-over-HTTPS on App Platform
 
@@ -131,6 +164,9 @@ and Certificate-Transparency discovery all work. Consequences:
 | `PORT` | `8080` | Listen port (App Platform sets this automatically) |
 | `DNS_RESOLVER` | `https://cloudflare-dns.com/dns-query` | DoH URL, or `ip:port` for classic DNS |
 | `SCAN_TIMEOUT` | `60s` | Overall per-scan timeout |
+| `API_KEY` | unset | If set, `/api/scan` requires this key (Bearer / X-API-Key / `?api_key=`) |
+| `RATE_LIMIT` | `30` | Requests per minute per client IP for `/api/*` (0 disables) |
+| `CORS_ORIGINS` | unset | Comma-separated allowed origins, or `*` (enables CORS) |
 | `ALLOW_BRUTE` | unset | `1` to allow brute force via the API |
 | `VT_API_KEY` / `ST_API_KEY` | unset | Optional passive-DNS keys |
 

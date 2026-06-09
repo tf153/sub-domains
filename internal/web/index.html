@@ -77,6 +77,13 @@
         <label><input type="checkbox" id="owner" checked /> IP owner</label>
         <label><input type="checkbox" id="takeover" checked /> Takeover</label>
       </div>
+      <div class="opts" style="width:100%">
+        <label style="flex:1 1 100%">
+          API key (only if the server requires one — stored locally in your browser):
+          <input type="text" id="apikey" placeholder="optional" autocomplete="off"
+                 style="flex:1 1 220px; margin-left:8px; padding:6px 10px; background:var(--panel2); border:1px solid var(--line); color:var(--text); border-radius:8px; font-size:13px;" />
+        </label>
+      </div>
     </form>
     <div class="status" id="status"></div>
   </div>
@@ -91,6 +98,10 @@
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// Persist the API key locally so users don't retype it.
+$("apikey").value = localStorage.getItem("subscope_api_key") || "";
+$("apikey").addEventListener("change", () => localStorage.setItem("subscope_api_key", $("apikey").value.trim()));
 
 $("f").addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -110,8 +121,11 @@ $("f").addEventListener("submit", async (e) => {
   };
 
   try {
+    const headers = {"Content-Type":"application/json"};
+    const key = $("apikey").value.trim();
+    if (key) headers["X-API-Key"] = key;
     const res = await fetch("/api/scan", {
-      method: "POST", headers: {"Content-Type":"application/json"},
+      method: "POST", headers,
       body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error("Server returned " + res.status + ": " + (await res.text()));

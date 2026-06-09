@@ -35,8 +35,22 @@ services:
       - key: SCAN_TIMEOUT
         value: "60s"
         scope: RUN_TIME
-      # Optional passive-DNS API keys. Set these as encrypted secrets in the
-      # dashboard or via `doctl`, then uncomment:
+      # Per-client-IP request limit for /api/* (requests per minute). 0 disables.
+      - key: RATE_LIMIT
+        value: "30"
+        scope: RUN_TIME
+      # Protect the API with a key. STRONGLY RECOMMENDED for a public URL.
+      # Set the real value as an encrypted secret in the dashboard (or via
+      # `doctl apps update`), replacing the placeholder below.
+      - key: API_KEY
+        value: "CHANGE_ME_TO_A_LONG_RANDOM_SECRET"
+        type: SECRET
+        scope: RUN_TIME
+      # Comma-separated allowed CORS origins, or "*". Leave unset to disable CORS.
+      # - key: CORS_ORIGINS
+      #   value: "https://yourfrontend.com"
+      #   scope: RUN_TIME
+      # Optional passive-DNS API keys (encrypted secrets):
       # - key: VT_API_KEY
       #   value: "YOUR_VIRUSTOTAL_KEY"
       #   type: SECRET
