@@ -11,11 +11,12 @@ import (
 )
 
 type entry struct {
-	report  *model.Report
-	expires time.Time
+	report   *model.Report
+	discover *model.DiscoverResult
+	expires  time.Time
 }
 
-// Cache is a concurrency-safe TTL cache of scan reports.
+// Cache is a concurrency-safe TTL cache of scan reports and discovery results.
 type Cache struct {
 	mu  sync.Mutex
 	m   map[string]entry
@@ -30,6 +31,32 @@ func New(ttl time.Duration) *Cache {
 		go c.gc()
 	}
 	return c
+}
+
+// GetDiscover returns a cached discovery result (a copy) if present/unexpired.
+func (c *Cache) GetDiscover(key string) (*model.DiscoverResult, bool) {
+	if c.ttl <= 0 {
+		return nil, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.m[key]
+	if !ok || e.discover == nil || time.Now().After(e.expires) {
+		return nil, false
+	}
+	cp := *e.discover
+	cp.Cached = true
+	return &cp, true
+}
+
+// SetDiscover stores a discovery result under key.
+func (c *Cache) SetDiscover(key string, res *model.DiscoverResult) {
+	if c.ttl <= 0 || res == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[key] = entry{discover: res, expires: time.Now().Add(c.ttl)}
 }
 
 // Get returns a cached report (a copy) if present and unexpired.

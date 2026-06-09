@@ -44,8 +44,35 @@ type Options struct {
 	Log          io.Writer // progress log (e.g. os.Stderr); may be nil
 }
 
-// Run executes the scan and returns a populated Report.
+// Run executes a full scan (discovery + enrichment) and returns a Report.
+// It is the convenience path used by the CLI.
 func (o Options) Run(ctx context.Context) (*model.Report, error) {
+	started := time.Now()
+	disc, err := o.Discover(ctx)
+	if err != nil {
+		return nil, err
+	}
+	hosts := make([]string, len(disc.Hosts))
+	srcByHost := make(map[string][]string, len(disc.Hosts))
+	for i, h := range disc.Hosts {
+		hosts[i] = h.Host
+		srcByHost[h.Host] = h.Sources
+	}
+
+	report := o.EnrichHosts(ctx, hosts, srcByHost)
+	report.Domain = o.Domain
+	report.Whois = disc.Whois
+	report.Sources = disc.Sources
+	report.Duration = time.Since(started).Round(time.Millisecond).String()
+	o.logf("[*] Done. %d hosts in report (%s).\n", len(report.Records), report.Duration)
+	return report, nil
+}
+
+// Discover runs only the discovery sources and returns the hostnames found,
+// with per-source status and (optionally) WHOIS. This is the fast first phase:
+// it performs no DNS resolution or IP-owner lookups, so it returns as soon as
+// the discovery sources finish (bounded by SourceTimeout).
+func (o Options) Discover(ctx context.Context) (*model.DiscoverResult, error) {
 	started := time.Now()
 	if o.Concurrency <= 0 {
 		o.Concurrency = 50
@@ -158,7 +185,7 @@ func (o Options) Run(ctx context.Context) (*model.Report, error) {
 	_ = leakedNS
 
 	items := found.Items()
-	o.logf("[*] Discovery complete: %d unique hosts. Enriching...\n", len(items))
+	o.logf("[*] Discovery complete: %d unique hosts (%s).\n", len(items), time.Since(started).Round(time.Millisecond))
 
 	// Attribute host counts to each source, then assemble ordered statuses.
 	counts := map[string]int{}
@@ -177,16 +204,37 @@ func (o Options) Run(ctx context.Context) (*model.Report, error) {
 		sourceStatuses = append(sourceStatuses, *st)
 	}
 
-	// --- Enrichment phase ---
-	report := &model.Report{Domain: o.Domain, Sources: sourceStatuses}
+	result := &model.DiscoverResult{Domain: o.Domain, Sources: sourceStatuses}
 
+	// WHOIS is a single fast RDAP call; include it in discovery so the first
+	// paint already has registrar/nameserver info.
 	if o.EnableWhois {
 		if info, err := rdap.Domain(ctx, o.Domain); err != nil {
 			o.logf("[-] whois: %v\n", err)
 		} else {
-			report.Whois = info
+			result.Whois = info
 		}
 	}
+
+	for host, sources := range items {
+		sort.Strings(sources)
+		result.Hosts = append(result.Hosts, model.DiscoveredHost{Host: host, Sources: sources})
+	}
+	sort.Slice(result.Hosts, func(i, j int) bool { return result.Hosts[i].Host < result.Hosts[j].Host })
+	result.Duration = time.Since(started).Round(time.Millisecond).String()
+	return result, nil
+}
+
+// EnrichHosts resolves DNS records, IP owners, and takeover signals for the
+// given hosts. srcByHost optionally carries the discovery sources per host (so
+// they appear in the records); pass nil if not available. This is the second
+// phase — it makes no calls to the discovery providers.
+func (o Options) EnrichHosts(ctx context.Context, hosts []string, srcByHost map[string][]string) *model.Report {
+	if o.Concurrency <= 0 {
+		o.Concurrency = 50
+	}
+	resolver := dnsx.New(o.Resolver, o.Timeout)
+	report := &model.Report{Domain: o.Domain}
 
 	recCh := make(chan *model.Record)
 	var results []model.Record
@@ -203,7 +251,7 @@ func (o Options) Run(ctx context.Context) (*model.Report, error) {
 				if o.EnableOwner {
 					ips := append(append([]string{}, rec.A...), rec.AAAA...)
 					owners := make([]model.IPOwner, len(ips))
-					var ok []bool = make([]bool, len(ips))
+					okFlags := make([]bool, len(ips))
 					var owg sync.WaitGroup
 					owg.Add(len(ips))
 					for i, ip := range ips {
@@ -211,13 +259,13 @@ func (o Options) Run(ctx context.Context) (*model.Report, error) {
 							defer owg.Done()
 							if owner, err := rdap.IP(ctx, ip); err == nil {
 								owners[i] = *owner
-								ok[i] = true
+								okFlags[i] = true
 							}
 						}(i, ip)
 					}
 					owg.Wait()
 					for i := range owners {
-						if ok[i] {
+						if okFlags[i] {
 							rec.IPOwners = append(rec.IPOwners, owners[i])
 						}
 					}
@@ -233,18 +281,15 @@ func (o Options) Run(ctx context.Context) (*model.Report, error) {
 		}()
 	}
 
-	for host, sources := range items {
-		sort.Strings(sources)
-		recCh <- &model.Record{Host: host, Sources: sources}
+	for _, host := range hosts {
+		recCh <- &model.Record{Host: host, Sources: srcByHost[host]}
 	}
 	close(recCh)
 	ewg.Wait()
 
 	sort.Slice(results, func(i, j int) bool { return results[i].Host < results[j].Host })
 	report.Records = results
-	report.Duration = time.Since(started).Round(time.Millisecond).String()
-	o.logf("[*] Done. %d hosts in report (%s).\n", len(results), report.Duration)
-	return report, nil
+	return report
 }
 
 func (o Options) logf(format string, args ...any) {

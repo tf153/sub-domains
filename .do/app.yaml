@@ -43,6 +43,13 @@ services:
       - key: CACHE_TTL
         value: "10m"
         scope: RUN_TIME
+      # Fast two-phase discovery budgets (lower = snappier first paint).
+      - key: DISCOVER_TIMEOUT
+        value: "12s"
+        scope: RUN_TIME
+      - key: SOURCE_TIMEOUT
+        value: "10s"
+        scope: RUN_TIME
       # Protect the API with a key. STRONGLY RECOMMENDED for a public URL.
       # Set the real value as an encrypted secret in the dashboard (or via
       # `doctl apps update`), replacing the placeholder below.

@@ -111,25 +111,53 @@ $("f").addEventListener("submit", async (e) => {
   $("status").textContent = "Scanning " + domain + " … this can take 10–40s.";
   $("results").innerHTML = "";
 
-  const body = {
-    domain,
-    passive: $("passive").checked,
-    brute: $("brute").checked,
-    whois: $("whois").checked,
-    owner: $("owner").checked,
-    takeover: $("takeover").checked,
-  };
+  const headers = {"Content-Type":"application/json"};
+  const key = $("apikey").value.trim();
+  if (key) headers["X-API-Key"] = key;
+
+  const wantOwner = $("owner").checked;
+  const wantTakeover = $("takeover").checked;
 
   try {
-    const headers = {"Content-Type":"application/json"};
-    const key = $("apikey").value.trim();
-    if (key) headers["X-API-Key"] = key;
-    const res = await fetch("/api/scan", {
+    // --- Phase 1: fast discovery (just the subdomain list) ---
+    const t0 = performance.now();
+    const dres = await fetch("/api/discover", {
       method: "POST", headers,
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        domain,
+        passive: $("passive").checked,
+        whois: $("whois").checked,
+      }),
     });
-    if (!res.ok) throw new Error("Server returned " + res.status + ": " + (await res.text()));
-    const report = await res.json();
+    if (!dres.ok) throw new Error("Server returned " + dres.status + ": " + (await dres.text()));
+    const disc = await dres.json();
+    const took = ((performance.now() - t0) / 1000).toFixed(1);
+
+    // Render the host list immediately (no DNS details yet).
+    const report = {
+      domain: disc.domain,
+      whois: disc.whois,
+      sources: disc.sources,
+      duration: disc.duration,
+      cached: disc.cached,
+      records: (disc.hosts || []).map(h => ({ host: h.host, sources: h.sources, _pending: true })),
+    };
+    render(report);
+    $("status").textContent = `Found ${report.records.length} subdomains in ${took}s. Resolving DNS & owners…`;
+
+    // --- Phase 2: enrich in the background ---
+    const hosts = (disc.hosts || []).map(h => h.host);
+    if (hosts.length === 0) { $("status").textContent = "No subdomains found."; return; }
+
+    const eres = await fetch("/api/enrich", {
+      method: "POST", headers,
+      body: JSON.stringify({ domain, hosts, owner: wantOwner, takeover: wantTakeover }),
+    });
+    if (!eres.ok) { $("status").innerHTML = '<span class="err">enrichment failed: ' + esc(await eres.text()) + '</span>'; return; }
+    const enriched = await eres.json();
+
+    // Merge enriched records back into the report and re-render.
+    report.records = enriched.records || report.records;
     render(report);
     $("status").textContent = "Done.";
   } catch (err) {
@@ -189,12 +217,18 @@ function render(r) {
       <th>Host</th><th>Addresses</th><th>IP owner (who holds it)</th><th>Sources</th>
     </tr></thead><tbody>`;
   for (const x of recs) {
-    let addr = [].concat(x.a||[], x.aaaa||[]).map(esc).join("<br>");
-    if (!addr && x.cname) addr = "CNAME " + x.cname.map(esc).join(", ");
-    if (!addr) addr = '<span class="pill no">no A/AAAA</span>';
-    let owner = "—";
-    if (x.ip_owners && x.ip_owners.length) {
-      owner = [...new Set(x.ip_owners.map(o => esc(o.org||o.handle||"") + (o.asn ? " ["+esc(o.asn)+"]" : "")))].join("<br>");
+    let addr, owner;
+    if (x._pending) {
+      addr = '<span class="pill no">resolving…</span>';
+      owner = '<span class="pill no">…</span>';
+    } else {
+      addr = [].concat(x.a||[], x.aaaa||[]).map(esc).join("<br>");
+      if (!addr && x.cname) addr = "CNAME " + x.cname.map(esc).join(", ");
+      if (!addr) addr = '<span class="pill no">no A/AAAA</span>';
+      owner = "—";
+      if (x.ip_owners && x.ip_owners.length) {
+        owner = [...new Set(x.ip_owners.map(o => esc(o.org||o.handle||"") + (o.asn ? " ["+esc(o.asn)+"]" : "")))].join("<br>");
+      }
     }
     const tags = (x.sources||[]).map(s => `<span class="tag">${esc(s)}</span>`).join("");
     html += `<tr><td class="host">${esc(x.host)}</td><td class="mono">${addr}</td><td>${owner}</td><td>${tags}</td></tr>`;

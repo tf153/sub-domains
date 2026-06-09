@@ -54,10 +54,12 @@ type scanRequest struct {
 }
 
 type server struct {
-	resolver    string
-	scanTimeout time.Duration
-	allowBrute  bool
-	cache       *cache.Cache
+	resolver        string
+	scanTimeout     time.Duration
+	discoverTimeout time.Duration
+	sourceTimeout   time.Duration
+	allowBrute      bool
+	cache           *cache.Cache
 }
 
 func main() {
@@ -69,10 +71,12 @@ func main() {
 	cacheTTL := durEnv("CACHE_TTL", 10*time.Minute)
 
 	s := &server{
-		resolver:    env("DNS_RESOLVER", "https://cloudflare-dns.com/dns-query"),
-		scanTimeout: durEnv("SCAN_TIMEOUT", 60*time.Second),
-		allowBrute:  os.Getenv("ALLOW_BRUTE") == "1",
-		cache:       cache.New(cacheTTL),
+		resolver:        env("DNS_RESOLVER", "https://cloudflare-dns.com/dns-query"),
+		scanTimeout:     durEnv("SCAN_TIMEOUT", 60*time.Second),
+		discoverTimeout: durEnv("DISCOVER_TIMEOUT", 12*time.Second),
+		sourceTimeout:   durEnv("SOURCE_TIMEOUT", 10*time.Second),
+		allowBrute:      os.Getenv("ALLOW_BRUTE") == "1",
+		cache:           cache.New(cacheTTL),
 	}
 
 	mux := http.NewServeMux()
@@ -80,6 +84,8 @@ func main() {
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/api", s.handleAPIDocs)
 	mux.HandleFunc("/api/scan", s.handleScan)
+	mux.HandleFunc("/api/discover", s.handleDiscover)
+	mux.HandleFunc("/api/enrich", s.handleEnrich)
 
 	// Paths that bypass auth + rate limiting (UI, health, docs).
 	exempt := map[string]bool{"/": true, "/healthz": true, "/api": true}
@@ -136,17 +142,24 @@ func (s *server) handleAPIDocs(w http.ResponseWriter, r *http.Request) {
 		},
 		"endpoints": []map[string]any{
 			{
+				"method":      "GET/POST",
+				"path":        "/api/discover",
+				"description": "FAST: discovered subdomains only (no DNS/owner). Returns in a few seconds.",
+				"body":        map[string]any{"domain": "example.com", "passive": true, "whois": true},
+			},
+			{
 				"method":      "POST",
+				"path":        "/api/enrich",
+				"description": "Resolve DNS records + IP owners + takeover for a list of hosts from /api/discover.",
+				"body":        map[string]any{"domain": "example.com", "hosts": []string{"www.example.com"}, "owner": true, "takeover": true},
+			},
+			{
+				"method":      "GET/POST",
 				"path":        "/api/scan",
-				"description": "Run a subdomain discovery + enrichment scan.",
+				"description": "Full one-shot scan (discovery + enrichment). Slower; use discover+enrich for fast UIs.",
 				"body": scanRequest{
 					Domain: "example.com", Passive: true, Whois: true, Owner: true, Takeover: true,
 				},
-			},
-			{
-				"method":      "GET",
-				"path":        "/api/scan?domain=example.com&passive=1&whois=1&owner=1&takeover=1&brute=0",
-				"description": "Same scan via query parameters (convenient for curl/browser).",
 			},
 		},
 		"notes": []string{
@@ -219,6 +232,120 @@ func (s *server) handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.cache.Set(key, report)
+	writeJSON(w, http.StatusOK, report)
+}
+
+// handleDiscover is the FAST phase: it only runs discovery sources (no DNS or
+// IP-owner enrichment) and returns the hostnames quickly, bounded by a short
+// per-source budget. The UI calls this first for an instant first paint.
+func (s *server) handleDiscover(w http.ResponseWriter, r *http.Request) {
+	var req scanRequest
+	switch r.Method {
+	case http.MethodPost:
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad request: " + err.Error()})
+			return
+		}
+	case http.MethodGet:
+		q := r.URL.Query()
+		req = scanRequest{
+			Domain:  q.Get("domain"),
+			Passive: boolParam(q.Get("passive"), true),
+			Whois:   boolParam(q.Get("whois"), true),
+		}
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "use GET or POST"})
+		return
+	}
+
+	domain := sanitizeDomain(req.Domain)
+	if domain == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid or missing domain"})
+		return
+	}
+
+	key := fmt.Sprintf("discover|%s|p=%t|w=%t", domain, req.Passive, req.Whois)
+	if cached, ok := s.cache.GetDiscover(key); ok {
+		writeJSON(w, http.StatusOK, cached)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), s.discoverTimeout)
+	defer cancel()
+
+	opts := scan.Options{
+		Domain:        domain,
+		Resolver:      s.resolver,
+		Concurrency:   60,
+		Timeout:       5 * time.Second,
+		SourceTimeout: s.sourceTimeout,
+		EnablePassive: req.Passive,
+		EnableWhois:   req.Whois,
+	}
+	res, err := opts.Discover(ctx)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "discover failed: " + err.Error()})
+		return
+	}
+	s.cache.SetDiscover(key, res)
+	writeJSON(w, http.StatusOK, res)
+}
+
+type enrichRequest struct {
+	Domain   string   `json:"domain"`
+	Hosts    []string `json:"hosts"`
+	Owner    bool     `json:"owner"`
+	Takeover bool     `json:"takeover"`
+}
+
+// handleEnrich is the SECOND phase: given a list of hosts (from /api/discover),
+// it resolves DNS records, IP owners, and takeover signals. The UI calls this
+// after rendering the host list, so details fill in progressively.
+func (s *server) handleEnrich(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST only"})
+		return
+	}
+	var req enrichRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad request: " + err.Error()})
+		return
+	}
+	domain := sanitizeDomain(req.Domain)
+	if domain == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid or missing domain"})
+		return
+	}
+
+	// Validate + cap the host list (defend against abuse / huge payloads).
+	const maxHosts = 1000
+	var hosts []string
+	for _, h := range req.Hosts {
+		if hh := sanitizeDomain(h); hh != "" && (hh == domain || strings.HasSuffix(hh, "."+domain)) {
+			hosts = append(hosts, hh)
+			if len(hosts) >= maxHosts {
+				break
+			}
+		}
+	}
+	if len(hosts) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no valid hosts for domain"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), s.scanTimeout)
+	defer cancel()
+
+	opts := scan.Options{
+		Domain:         domain,
+		Resolver:       s.resolver,
+		Concurrency:    60,
+		Timeout:        6 * time.Second,
+		EnableOwner:    req.Owner,
+		EnableTakeover: req.Takeover,
+	}
+	report := opts.EnrichHosts(ctx, hosts, nil)
+	report.Domain = domain
 	writeJSON(w, http.StatusOK, report)
 }
 

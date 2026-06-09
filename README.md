@@ -112,8 +112,32 @@ PORT=8099 ./bin/server          # then open http://localhost:8099
 | `GET` | `/` | Web UI |
 | `GET` | `/healthz` | Health check |
 | `GET` | `/api` | Self-describing JSON API docs |
-| `POST` | `/api/scan` | Run a scan (JSON body) |
-| `GET` | `/api/scan?domain=...` | Run a scan via query params (handy for curl) |
+| `GET`/`POST` | `/api/discover` | **Fast**: discovered subdomains only (no DNS/owner) |
+| `POST` | `/api/enrich` | Resolve DNS + IP owner + takeover for a host list |
+| `GET`/`POST` | `/api/scan` | Full one-shot scan (discovery + enrichment) |
+
+### Fast two-phase flow (recommended for UIs)
+
+A full scan waits on slow third-party sources (crt.sh especially), so it can
+take 10-30s. For a responsive UI, use the two-phase API — this is what the web
+UI does:
+
+1. `POST /api/discover` → returns the subdomain list in a few seconds. Render
+   it immediately.
+2. `POST /api/enrich` with those hosts → resolves DNS records + IP owners +
+   takeover (≈1-2s for ~50 hosts) and fills in the details.
+
+```bash
+# Phase 1 — fast list
+curl "https://YOUR-APP.ondigitalocean.app/api/discover?domain=example.com" -H 'X-API-Key: KEY'
+
+# Phase 2 — enrich
+curl -X POST "https://YOUR-APP.ondigitalocean.app/api/enrich" -H 'X-API-Key: KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"domain":"example.com","hosts":["www.example.com"],"owner":true,"takeover":true}'
+```
+
+`/api/scan` remains available for a single-call full report.
 
 **Authentication.** If `API_KEY` is set, every `/api/scan` call must send the
 key (the UI, `/`, `/healthz`, and `/api` docs stay public). Pass it any of:
@@ -168,6 +192,8 @@ and Certificate-Transparency discovery all work. Consequences:
 | `RATE_LIMIT` | `30` | Requests per minute per client IP for `/api/*` (0 disables) |
 | `CORS_ORIGINS` | unset | Comma-separated allowed origins, or `*` (enables CORS) |
 | `CACHE_TTL` | `10m` | Cache identical scans for this long (0 disables) |
+| `DISCOVER_TIMEOUT` | `12s` | Overall budget for `/api/discover` |
+| `SOURCE_TIMEOUT` | `10s` | Per-source budget during discovery (lower = faster first paint) |
 | `ALLOW_BRUTE` | unset | `1` to allow brute force via the API |
 | `VT_API_KEY` / `ST_API_KEY` | unset | Optional passive-DNS keys |
 

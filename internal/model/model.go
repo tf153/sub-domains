@@ -67,6 +67,23 @@ type SourceStatus struct {
 	Detail string `json:"detail,omitempty"` // error or skip reason
 }
 
+// DiscoverResult is the fast first-phase output: just the discovered hostnames
+// (no DNS/owner enrichment) plus per-source status and optional WHOIS.
+type DiscoverResult struct {
+	Domain   string                 `json:"domain"`
+	Hosts    []DiscoveredHost       `json:"hosts"`
+	Whois    *DomainInfo            `json:"whois,omitempty"`
+	Sources  []SourceStatus         `json:"sources,omitempty"`
+	Cached   bool                   `json:"cached,omitempty"`
+	Duration string                 `json:"duration,omitempty"`
+}
+
+// DiscoveredHost is a hostname plus which sources found it (pre-enrichment).
+type DiscoveredHost struct {
+	Host    string   `json:"host"`
+	Sources []string `json:"sources"`
+}
+
 // Report is the complete output of a scan.
 type Report struct {
 	Domain   string         `json:"domain"`
