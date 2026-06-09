@@ -3,9 +3,12 @@
 package dnsx
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"strings"
 	"time"
 
@@ -14,14 +17,25 @@ import (
 )
 
 // Resolver performs DNS queries against a configured upstream server.
+//
+// It supports two transports:
+//   - Classic UDP/TCP DNS to an "ip:port" server (the default).
+//   - DNS-over-HTTPS (RFC 8484) when server is an "https://" URL. This is
+//     essential on platforms like DigitalOcean App Platform that block raw
+//     outbound UDP/53 but allow HTTPS.
 type Resolver struct {
-	client *dns.Client
-	server string // host:port of upstream resolver
-	net    *net.Resolver
+	client  *dns.Client
+	server  string // "ip:port" for classic DNS, or "https://..." for DoH
+	doh     bool
+	httpc   *http.Client
+	timeout time.Duration
+	net     *net.Resolver
 }
 
-// New creates a Resolver. server should be "ip:port" (e.g. "1.1.1.1:53").
-// If server is empty it defaults to Cloudflare's 1.1.1.1.
+// New creates a Resolver. server may be:
+//   - "" → defaults to Cloudflare's 1.1.1.1:53 (classic DNS)
+//   - "ip:port" → classic UDP/TCP DNS
+//   - "https://host/dns-query" → DNS-over-HTTPS
 func New(server string, timeout time.Duration) *Resolver {
 	if server == "" {
 		server = "1.1.1.1:53"
@@ -29,17 +43,25 @@ func New(server string, timeout time.Duration) *Resolver {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	return &Resolver{
-		client: &dns.Client{Timeout: timeout},
-		server: server,
-		net: &net.Resolver{
+
+	r := &Resolver{
+		client:  &dns.Client{Timeout: timeout},
+		server:  server,
+		timeout: timeout,
+		doh:     strings.HasPrefix(server, "https://"),
+		httpc:   &http.Client{Timeout: timeout},
+	}
+
+	if !r.doh {
+		r.net = &net.Resolver{
 			PreferGo: true,
 			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
 				d := net.Dialer{Timeout: timeout}
 				return d.DialContext(ctx, network, server)
 			},
-		},
+		}
 	}
+	return r
 }
 
 // Exists returns true if host has an A, AAAA or CNAME answer. It is the fast
@@ -74,11 +96,49 @@ func (r *Resolver) query(ctx context.Context, host string, qtype uint16) []dns.R
 	m.SetQuestion(dns.Fqdn(host), qtype)
 	m.RecursionDesired = true
 
-	resp, _, err := r.client.ExchangeContext(ctx, m, r.server)
+	var resp *dns.Msg
+	var err error
+	if r.doh {
+		resp, err = r.exchangeDoH(ctx, m)
+	} else {
+		resp, _, err = r.client.ExchangeContext(ctx, m, r.server)
+	}
 	if err != nil || resp == nil || len(resp.Answer) == 0 {
 		return nil
 	}
 	return resp.Answer
+}
+
+// exchangeDoH performs a DNS query over HTTPS (RFC 8484, application/dns-message).
+func (r *Resolver) exchangeDoH(ctx context.Context, m *dns.Msg) (*dns.Msg, error) {
+	packed, err := m.Pack()
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.server, bytes.NewReader(packed))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/dns-message")
+	req.Header.Set("Accept", "application/dns-message")
+
+	resp, err := r.httpc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("doh status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		return nil, err
+	}
+	out := new(dns.Msg)
+	if err := out.Unpack(body); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // lookupStrings returns string representations of the requested record type.

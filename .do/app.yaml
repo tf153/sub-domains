@@ -1,0 +1,47 @@
+# DigitalOcean App Platform spec for subscope.
+#
+# Deploy with:
+#   doctl apps create --spec .do/app.yaml
+# Update an existing app:
+#   doctl apps update <APP_ID> --spec .do/app.yaml
+#
+# Or use the dashboard: Create > Apps > connect this GitHub repo (the Dockerfile
+# is auto-detected).
+name: subscope
+region: nyc
+services:
+  - name: web
+    # Build from the Dockerfile at the repo root.
+    dockerfile_path: Dockerfile
+    source_dir: /
+    github:
+      repo: tf153/sub-domains
+      branch: main
+      deploy_on_push: true
+    http_port: 8080
+    instance_count: 1
+    instance_size_slug: apps-s-1vcpu-0.5gb
+    routes:
+      - path: /
+    health_check:
+      http_path: /healthz
+      initial_delay_seconds: 5
+      period_seconds: 15
+    envs:
+      # App Platform blocks raw UDP/53, so resolve via DNS-over-HTTPS.
+      - key: DNS_RESOLVER
+        value: https://cloudflare-dns.com/dns-query
+        scope: RUN_TIME
+      - key: SCAN_TIMEOUT
+        value: "60s"
+        scope: RUN_TIME
+      # Optional passive-DNS API keys. Set these as encrypted secrets in the
+      # dashboard or via `doctl`, then uncomment:
+      # - key: VT_API_KEY
+      #   value: "YOUR_VIRUSTOTAL_KEY"
+      #   type: SECRET
+      #   scope: RUN_TIME
+      # - key: ST_API_KEY
+      #   value: "YOUR_SECURITYTRAILS_KEY"
+      #   type: SECRET
+      #   scope: RUN_TIME

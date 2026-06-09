@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>subscope — DNS recon</title>
+<style>
+  :root {
+    --bg: #0b1020; --panel: #141b33; --panel2: #1b2444; --line: #283255;
+    --text: #e7ecff; --muted: #93a0c8; --accent: #5b8cff; --accent2: #34d399;
+    --warn: #f59e0b; --danger: #f87171;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    background: radial-gradient(1200px 600px at 70% -10%, #1a2550 0, var(--bg) 60%);
+    color: var(--text); min-height: 100vh;
+  }
+  header { padding: 28px 20px 8px; text-align: center; }
+  h1 { margin: 0; font-size: 26px; letter-spacing: .3px; }
+  h1 .dot { color: var(--accent2); }
+  .sub { color: var(--muted); margin-top: 4px; font-size: 13px; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 16px 20px 60px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; margin-top: 18px; }
+  form { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  input[type=text] {
+    flex: 1 1 320px; background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+    padding: 12px 14px; border-radius: 10px; font-size: 16px; outline: none;
+  }
+  input[type=text]:focus { border-color: var(--accent); }
+  button {
+    background: linear-gradient(180deg, var(--accent), #3f72f0); color: white; border: 0;
+    padding: 12px 20px; border-radius: 10px; font-size: 15px; font-weight: 600; cursor: pointer;
+  }
+  button:disabled { opacity: .6; cursor: progress; }
+  .opts { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 12px; color: var(--muted); font-size: 13px; }
+  .opts label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; user-select: none; }
+  .status { margin-top: 14px; color: var(--muted); font-size: 13px; white-space: pre-wrap; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px,1fr)); gap: 10px; margin-top: 6px; }
+  .stat { background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
+  .stat b { display: block; font-size: 22px; }
+  .stat span { color: var(--muted); font-size: 12px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
+  td.host { font-weight: 600; }
+  .tag { display: inline-block; background: var(--panel2); border: 1px solid var(--line); color: var(--muted);
+         border-radius: 6px; padding: 1px 7px; font-size: 11px; margin: 1px 2px 1px 0; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+  .takeover { background: rgba(248,113,113,.12); border: 1px solid var(--danger); border-radius: 10px; padding: 12px; margin-top: 14px; }
+  .takeover h3 { margin: 0 0 6px; color: var(--danger); }
+  .whois { color: var(--muted); font-size: 13px; }
+  .whois b { color: var(--text); }
+  a { color: var(--accent); }
+  .err { color: var(--danger); }
+  footer { text-align: center; color: var(--muted); font-size: 12px; padding: 20px; }
+  .pill { font-size: 11px; padding: 2px 8px; border-radius: 999px; }
+  .pill.ok { background: rgba(52,211,153,.15); color: var(--accent2); }
+  .pill.no { background: rgba(147,160,200,.15); color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <h1>sub<span class="dot">scope</span></h1>
+  <div class="sub">DNS recon &amp; subdomain discovery — Certificate Transparency, passive DNS, RDAP/WHOIS &amp; takeover checks</div>
+</header>
+
+<div class="wrap">
+  <div class="card">
+    <form id="f">
+      <input id="domain" type="text" placeholder="example.com" autocomplete="off" autofocus />
+      <button id="go" type="submit">Scan</button>
+      <div class="opts">
+        <label><input type="checkbox" id="passive" checked /> Passive DNS</label>
+        <label><input type="checkbox" id="brute" /> Brute force</label>
+        <label><input type="checkbox" id="whois" checked /> WHOIS</label>
+        <label><input type="checkbox" id="owner" checked /> IP owner</label>
+        <label><input type="checkbox" id="takeover" checked /> Takeover</label>
+      </div>
+    </form>
+    <div class="status" id="status"></div>
+  </div>
+
+  <div id="results"></div>
+</div>
+
+<footer>
+  Only scan domains you own or are authorized to assess. Public-data OSINT — respect source rate limits.
+</footer>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+$("f").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const domain = $("domain").value.trim().replace(/^https?:\/\//,'').replace(/\/.*$/,'');
+  if (!domain) return;
+  $("go").disabled = true;
+  $("status").textContent = "Scanning " + domain + " … this can take 10–40s.";
+  $("results").innerHTML = "";
+
+  const body = {
+    domain,
+    passive: $("passive").checked,
+    brute: $("brute").checked,
+    whois: $("whois").checked,
+    owner: $("owner").checked,
+    takeover: $("takeover").checked,
+  };
+
+  try {
+    const res = await fetch("/api/scan", {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error("Server returned " + res.status + ": " + (await res.text()));
+    const report = await res.json();
+    render(report);
+    $("status").textContent = "Done.";
+  } catch (err) {
+    $("status").innerHTML = '<span class="err">' + esc(err.message) + '</span>';
+  } finally {
+    $("go").disabled = false;
+  }
+});
+
+function render(r) {
+  const recs = r.records || [];
+  const resolved = recs.filter(x => x.resolved).length;
+  const takeovers = recs.filter(x => x.takeover && x.takeover.vulnerable);
+
+  let html = "";
+
+  if (r.whois) {
+    const w = r.whois;
+    html += `<div class="card"><div class="whois">
+      <b>WHOIS / RDAP</b> &nbsp; Registrar: <b>${esc(w.registrar||"n/a")}</b>
+      &nbsp;·&nbsp; Created: ${esc(w.created_at||"n/a")}
+      &nbsp;·&nbsp; Expires: ${esc(w.expires_at||"n/a")}
+      ${w.nameservers ? "<br>Nameservers: " + w.nameservers.map(esc).join(", ") : ""}
+    </div></div>`;
+  }
+
+  html += `<div class="card">
+    <div class="grid">
+      <div class="stat"><b>${recs.length}</b><span>subdomains found</span></div>
+      <div class="stat"><b>${resolved}</b><span>resolving</span></div>
+      <div class="stat"><b style="color:${takeovers.length?'var(--danger)':'var(--accent2)'}">${takeovers.length}</b><span>possible takeovers</span></div>
+    </div>`;
+
+  if (takeovers.length) {
+    html += `<div class="takeover"><h3>⚠ Possible subdomain takeovers</h3>`;
+    for (const t of takeovers) {
+      html += `<div>[${esc(t.takeover.service)}] <b>${esc(t.host)}</b> → <span class="mono">${esc(t.takeover.cname)}</span><br><span class="whois">${esc(t.takeover.reason)}</span></div>`;
+    }
+    html += `</div>`;
+  }
+
+  html += `<table><thead><tr>
+      <th>Host</th><th>Addresses</th><th>IP owner (who holds it)</th><th>Sources</th>
+    </tr></thead><tbody>`;
+  for (const x of recs) {
+    let addr = [].concat(x.a||[], x.aaaa||[]).map(esc).join("<br>");
+    if (!addr && x.cname) addr = "CNAME " + x.cname.map(esc).join(", ");
+    if (!addr) addr = '<span class="pill no">no A/AAAA</span>';
+    let owner = "—";
+    if (x.ip_owners && x.ip_owners.length) {
+      owner = [...new Set(x.ip_owners.map(o => esc(o.org||o.handle||"") + (o.asn ? " ["+esc(o.asn)+"]" : "")))].join("<br>");
+    }
+    const tags = (x.sources||[]).map(s => `<span class="tag">${esc(s)}</span>`).join("");
+    html += `<tr><td class="host">${esc(x.host)}</td><td class="mono">${addr}</td><td>${owner}</td><td>${tags}</td></tr>`;
+  }
+  html += `</tbody></table></div>`;
+
+  $("results").innerHTML = html;
+}
+</script>
+</body>
+</html>
